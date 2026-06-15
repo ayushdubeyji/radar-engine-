@@ -760,6 +760,10 @@ void setup() {
     int attempt = 1;
 
     while(!radarReady) {
+        if (attempt > 5) {
+            Serial.println("\n[WARNING] Handshake failed 5 times. Bypassing to prevent boot-loop. OTA active.");
+            break; 
+        }
         Serial.printf("\n[HANDSHAKE] Attempt %d to force Engineering Mode...\n", attempt);
         
         while(Radar1.available()) Radar1.read(); 
@@ -962,7 +966,14 @@ void loop() {
         
         float closestDist = primaryTarget.distance;
         float closestDelta = primaryTarget.delta;
-        bool targetFound = (primaryTarget.isAlive && closestDist <= 300.0);
+        
+        // Merge Helper distance if it is tracking a closer target
+        if (helperDist > 0.0 && (!primaryTarget.isAlive || helperDist < closestDist)) {
+            closestDist = helperDist;
+            closestDelta = helperDelta;
+        }
+        
+        bool targetFound = (closestDist > 0.0 && closestDist <= 300.0);
         
         if (currentLedMode == LED_MODE_DISTANCE) {
             if (targetFound) {

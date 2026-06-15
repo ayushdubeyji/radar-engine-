@@ -718,6 +718,10 @@ void setup() {
     int attempt = 1;
 
     while(!radarReady) {
+        if (attempt > 5) {
+            Serial.println("\n[WARNING] Handshake failed 5 times. Bypassing to prevent boot-loop. OTA active.");
+            break; 
+        }
         Serial.printf("\n[HANDSHAKE] Attempt %d to force Engineering Mode...\n", attempt);
         
         while(Radar1.available()) Radar1.read(); 
