@@ -989,7 +989,11 @@ void loop() {
                 targetLedBrightness = 0;
                 currentLedBrightnessF += (0.0 - currentLedBrightnessF) * 0.05; // Fade out slowly
                 currentLedBrightness = (int)currentLedBrightnessF;
-                leds[0] = currentLedBrightness == 0 ? CRGB::Black : CHSV(192, 255, currentLedBrightness);
+                if (currentLedBrightness == 0) {
+                    leds[0] = CRGB::Black;
+                } else {
+                    leds[0] = CHSV(192, 255, currentLedBrightness);
+                }
             }
         }
         FastLED.show();
