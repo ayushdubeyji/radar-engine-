@@ -7,7 +7,7 @@
 #include <ArduinoOTA.h>
 
 
-}
+
 
 const char* ssid = "Ayush";
 const char* password = "alibaba2123";
@@ -52,6 +52,17 @@ float smoothedDB[32] = {0};
 float smoothedDelta[32] = {0};
 int activeFrames[32] = {0};
 int maxActiveGate = 31; 
+
+// --- Advanced Persistence Tracker ---
+// Tracks the target with hysteresis so it doesn't flicker on and off.
+struct TargetTracker {
+    float distance = 0.0;
+    float delta = 0.0;
+    float confidence = 0.0;     // 0.0 to 100.0 scale
+    bool isAlive = false;
+    unsigned long lastSeen = 0;
+};
+TargetTracker primaryTarget;
 
 // --- Diagnostic Helper ---
 void sendDiag(String msg) {
@@ -741,6 +752,24 @@ void setup() {
         }
     }
     
+    // --- HARDWARE OPTIMIZATION & STABILIZATION (From LD2402 Manual) ---
+    // 1. Auto-Gain Calibration (0xEE00) - Optimizes SNR for the environment
+    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
+    Radar1.write(autoGainCmd, sizeof(autoGainCmd)); delay(50);
+    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
+    
+    // 2. Set Max Distance to 3.5m (Gate 5) to completely ignore deep-room ghosts.
+    // 3.5m is 35 in 10cm units. Parameter ID 0x0001
+    sendConfigCmd(0x0001, 35);
+    
+    // 3. Set Target Disappearance Delay to 5 seconds. Parameter ID 0x0004
+    sendConfigCmd(0x0004, 5);
+    
+    // 4. Save Config
+    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
+    Radar1.write(saveCmd, sizeof(saveCmd)); delay(50);
+    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
+
     lastDataRxTime = millis();
 }
 
@@ -823,7 +852,8 @@ void processExtractedPayload(uint8_t* payload, int len) {
             target["delta"] = smoothedDelta[i];
             target["isMoving"] = abs(smoothedDelta[i]) > 1.0;
             
-            if (smoothedDistance[i] < closestDist) {
+            // We look for any valid peak inside the 3m range
+            if (smoothedDistance[i] <= 350.0 && smoothedDistance[i] < closestDist) {
                 closestDist = smoothedDistance[i];
                 closestDelta = smoothedDelta[i];
             }
@@ -832,8 +862,33 @@ void processExtractedPayload(uint8_t* payload, int len) {
         }
     }
 
-    doc["primaryDistance"] = closestDist;
-    doc["primaryDelta"] = closestDelta;
+    // --- SOFTWARE POLLING & HYSTERESIS ---
+    // Instead of jumping distances rapidly, we build confidence in a target.
+    if (closestDist <= 350.0) {
+        primaryTarget.confidence += 20.0; // Rapidly gain confidence
+        if (primaryTarget.confidence > 100.0) primaryTarget.confidence = 100.0;
+        
+        // Smoothly interpolate the distance
+        if (!primaryTarget.isAlive) {
+            primaryTarget.distance = closestDist;
+            primaryTarget.isAlive = true;
+        } else {
+            primaryTarget.distance = (0.3 * closestDist) + (0.7 * primaryTarget.distance);
+        }
+        primaryTarget.delta = (0.2 * closestDelta) + (0.8 * primaryTarget.delta);
+        primaryTarget.lastSeen = millis();
+    } else {
+        // Slowly decay confidence if we miss frames (handles hardware jitter)
+        primaryTarget.confidence -= 2.0; 
+        if (primaryTarget.confidence <= 0.0 || (millis() - primaryTarget.lastSeen > 4000)) {
+            primaryTarget.confidence = 0.0;
+            primaryTarget.isAlive = false;
+        }
+    }
+
+    // Report the stable target to the UI
+    doc["primaryDistance"] = primaryTarget.isAlive ? primaryTarget.distance : 0.0;
+    doc["primaryDelta"] = primaryTarget.isAlive ? primaryTarget.delta : 0.0;
     
     
         
@@ -872,45 +927,11 @@ void loop() {
         
         static float currentLedBrightnessF = 0.0; // Float for ultra-smooth organic easing
         
-        // --- ADVANCED SOFTWARE TRACKER ---
-        // Overrides the hardware to filter out static ghosts (furniture/walls) 
-        // Locks exclusively onto the closest breathing or moving subject.
-        float candidateDist = 9999.0;
-        int candidateGate = -1;
-        
-        for (int i=2; i<=maxActiveGate; i++) {
-            if (activeFrames[i] > 2 && smoothedDB[i] > 10.0) { // Stable and has signal
-                if (abs(smoothedDelta[i]) > 0.3) { // Exhibiting micro-movements (breathing) or macro
-                    if (smoothedDistance[i] < candidateDist) {
-                        candidateDist = smoothedDistance[i];
-                        candidateGate = i;
-                    }
-                }
-            }
-        }
-        
-        static float softwareLockDist = 0.0;
-        static float softwareLockDelta = 0.0;
-        static unsigned long lastLockTime = 0;
-        
-        if (candidateGate != -1) {
-            // Smoothly update the lock distance so it doesn't jump
-            if (softwareLockDist == 0.0) softwareLockDist = candidateDist;
-            else softwareLockDist = (0.2 * candidateDist) + (0.8 * softwareLockDist);
-            
-            softwareLockDelta = smoothedDelta[candidateGate];
-            lastLockTime = millis();
-        } else {
-            // If subject stops breathing completely, hold the lock for 4 seconds before dropping
-            if (millis() - lastLockTime > 4000) { 
-                softwareLockDist = 0.0;
-                softwareLockDelta = 0.0;
-            }
-        }
-
-        float closestDist = softwareLockDist;
-        float closestDelta = softwareLockDelta;
-        bool targetFound = (closestDist > 0.0 && closestDist <= 300.0);
+        // Fetch the stable target from our global Persistence Tracker
+        float closestDist = primaryTarget.distance;
+        float closestDelta = primaryTarget.delta;
+        // Strictly only consider the target "Found" if it's alive AND within 300cm.
+        bool targetFound = (primaryTarget.isAlive && closestDist <= 300.0);
         
         if (currentLedMode == LED_MODE_DISTANCE) {
             if (targetFound) {
@@ -919,22 +940,24 @@ void loop() {
                     danceHue += 10;
                     targetLedBrightness = 255;
                 } else {
-                    // Exponential (Gamma Corrected) Mapping for human eye
+                    // Smooth Exponential Mapping
+                    // As distance goes from 300 down to 60, normalized goes from 0.0 to 1.0
                     float normalized = (300.0 - closestDist) / 240.0;
                     if (normalized < 0.0) normalized = 0.0;
                     if (normalized > 1.0) normalized = 1.0;
-                    targetLedBrightness = 5 + (250 * (normalized * normalized));
+                    // Apply x^2 curve for natural human eye brightness perception
+                    targetLedBrightness = (int)(255.0 * (normalized * normalized));
                 }
             } else {
-                // Target lost or out of range
+                // Guaranteed completely off when > 300cm or no target
                 targetLedBrightness = 0;
             }
             
             // Ultra-smooth organic glow in/out filter
-            // This filters out the "jumps" when the hardware distance updates discretely
+            // Slowly interpolates towards the target brightness
             float diff = targetLedBrightness - currentLedBrightnessF;
-            if (abs(diff) > 0.1) {
-                currentLedBrightnessF += (diff * 0.04); // Approx 1.5 seconds to fade smoothly
+            if (abs(diff) > 0.5) {
+                currentLedBrightnessF += (diff * 0.02); // Slower, highly elegant fade
             } else {
                 currentLedBrightnessF = targetLedBrightness;
             }
@@ -959,14 +982,14 @@ void loop() {
                 if (mappedB < 10) mappedB = 10; // Keep faint glow while breathing
                 
                 targetLedBrightness = mappedB;
-                currentLedBrightnessF = targetLedBrightness; // Direct zero-lag link to chest
-                currentLedBrightness = targetLedBrightness;
+                currentLedBrightnessF += (targetLedBrightness - currentLedBrightnessF) * 0.1; // Smooth breathing transitions
+                currentLedBrightness = (int)currentLedBrightnessF;
                 leds[0] = CHSV(192, 255, currentLedBrightness); // Purple glow
             } else {
                 targetLedBrightness = 0;
-                currentLedBrightnessF = 0;
-                currentLedBrightness = 0; // Immediate off
-                leds[0] = CRGB::Black;
+                currentLedBrightnessF += (0.0 - currentLedBrightnessF) * 0.05; // Fade out slowly
+                currentLedBrightness = (int)currentLedBrightnessF;
+                leds[0] = currentLedBrightness == 0 ? CRGB::Black : CHSV(192, 255, currentLedBrightness);
             }
         }
         FastLED.show();
