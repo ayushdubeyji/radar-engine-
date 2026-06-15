@@ -18,7 +18,11 @@ float helperDist = 0.0;
 float helperDelta = 0.0;
 unsigned long lastHelperRxTime = 0;
 
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void OnDataRecv(const esp_now_recv_info_t * esp_now_info, const uint8_t *incomingData, int len) {
+#else
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+#endif
     if (len == sizeof(struct_message)) {
         struct_message myData;
         memcpy(&myData, incomingData, sizeof(myData));
