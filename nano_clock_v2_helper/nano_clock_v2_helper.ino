@@ -17,6 +17,21 @@ typedef struct struct_message {
 struct_message myData;
 esp_now_peer_info_t peerInfo;
 
+// Radar Hex Protocols
+const byte enableCmd[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+const byte endCmd[]    = {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00, 0x04, 0x03, 0x02, 0x01};
+const byte saveCmd[]   = {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFD, 0x00, 0x04, 0x03, 0x02, 0x01};
+
+void sendConfigCmd(uint16_t paramId, uint32_t value) {
+    byte cmd[18] = {0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0x07, 0x00, 
+                    (byte)(paramId & 0xFF), (byte)(paramId >> 8),
+                    (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF), (byte)((value >> 16) & 0xFF), (byte)((value >> 24) & 0xFF),
+                    0x04, 0x03, 0x02, 0x01};
+    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
+    Radar1.write(cmd, sizeof(cmd)); delay(50);
+    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
+}
+
 // --- Radar State ---
 uint8_t frameBuf[2048];
 int frameLen = 0;
@@ -26,9 +41,16 @@ float smoothedDB[32] = {0};
 float smoothedDelta[32] = {0};
 int activeFrames[32] = {0};
 
-float softwareLockDist = 0.0;
-float softwareLockDelta = 0.0;
-unsigned long lastLockTime = 0;
+// --- Advanced Persistence Tracker ---
+struct TargetTracker {
+    float distance = 0.0;
+    float delta = 0.0;
+    float confidence = 0.0;
+    bool isAlive = false;
+    unsigned long lastSeen = 0;
+};
+TargetTracker primaryTarget;
+
 unsigned long lastDataRxTime = 0;
 
 void processExtractedPayload(uint8_t* payload, int len) {
@@ -84,28 +106,32 @@ void processExtractedPayload(uint8_t* payload, int len) {
     }
     
     // Helper Advanced Tracker
-    float candidateDist = 9999.0;
-    int candidateGate = -1;
+    float closestDist = 9999.0;
+    float closestDelta = 0.0;
     for (int i=2; i<=31; i++) {
-        if (activeFrames[i] > 2 && smoothedDB[i] > 10.0) {
-            if (abs(smoothedDelta[i]) > 0.3) {
-                if (smoothedDistance[i] < candidateDist) {
-                    candidateDist = smoothedDistance[i];
-                    candidateGate = i;
-                }
-            }
+        if (activeFrames[i] > 0 && smoothedDistance[i] <= 350.0 && smoothedDistance[i] < closestDist) {
+            closestDist = smoothedDistance[i];
+            closestDelta = smoothedDelta[i];
         }
     }
     
-    if (candidateGate != -1) {
-        if (softwareLockDist == 0.0) softwareLockDist = candidateDist;
-        else softwareLockDist = (0.2 * candidateDist) + (0.8 * softwareLockDist);
-        softwareLockDelta = smoothedDelta[candidateGate];
-        lastLockTime = millis();
+    if (closestDist <= 350.0) {
+        primaryTarget.confidence += 20.0;
+        if (primaryTarget.confidence > 100.0) primaryTarget.confidence = 100.0;
+        
+        if (!primaryTarget.isAlive) {
+            primaryTarget.distance = closestDist;
+            primaryTarget.isAlive = true;
+        } else {
+            primaryTarget.distance = (0.3 * closestDist) + (0.7 * primaryTarget.distance);
+        }
+        primaryTarget.delta = (0.2 * closestDelta) + (0.8 * primaryTarget.delta);
+        primaryTarget.lastSeen = millis();
     } else {
-        if (millis() - lastLockTime > 4000) { 
-            softwareLockDist = 0.0;
-            softwareLockDelta = 0.0;
+        primaryTarget.confidence -= 2.0; 
+        if (primaryTarget.confidence <= 0.0 || (millis() - primaryTarget.lastSeen > 4000)) {
+            primaryTarget.confidence = 0.0;
+            primaryTarget.isAlive = false;
         }
     }
 
@@ -113,8 +139,8 @@ void processExtractedPayload(uint8_t* payload, int len) {
     lastDataRxTime = millis();
     
     // Broadcast via ESP-NOW to all listening Masters
-    myData.dist = softwareLockDist;
-    myData.delta = softwareLockDelta;
+    myData.dist = primaryTarget.isAlive ? primaryTarget.distance : 0.0;
+    myData.delta = primaryTarget.isAlive ? primaryTarget.delta : 0.0;
     
     uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
@@ -154,6 +180,15 @@ void setup() {
     }
     
     myData.magic = 0xAA; // Magic byte so master knows it's us
+
+    Serial.println("[SYSTEM] Pushing hardware stabilization commands...");
+    sendConfigCmd(0x0001, 35); // 3.5m max
+    sendConfigCmd(0x0004, 5);  // 5s disappear delay
+    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
+    Radar1.write(saveCmd, sizeof(saveCmd)); delay(50);
+    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
+    Serial.println("[SYSTEM] Hardware optimization complete!");
+
     lastDataRxTime = millis();
 }
 
