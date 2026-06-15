@@ -90,7 +90,11 @@ TargetTracker primaryTarget;
 
 // --- Diagnostic Helper ---
 void sendDiag(String msg) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
     DynamicJsonDocument doc(512);
+#endif
     doc["type"] = "diag";
     doc["msg"] = msg;
     String out; serializeJson(doc, out);
@@ -683,7 +687,11 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
     if(type == WStype_TEXT) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+        JsonDocument doc;
+#else
         StaticJsonDocument<256> doc;
+#endif
         DeserializationError error = deserializeJson(doc, payload);
         if (!error) {
             String cmd = doc["cmd"];
@@ -835,7 +843,11 @@ void processExtractedPayload(uint8_t* payload, int len) {
         currentEnergiesDB[i] = round(dbVal * 10.0) / 10.0;
     }
 
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
     DynamicJsonDocument doc(4096);
+#endif
     doc["type"] = "data";
     doc["frames"] = framesParsed++;
     doc["primaryState"] = state;
