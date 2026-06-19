@@ -765,22 +765,9 @@ void setup() {
     }
     
     // --- HARDWARE OPTIMIZATION & STABILIZATION (From LD2402 Manual) ---
-    // 1. Auto-Gain Calibration (0xEE00) - Optimizes SNR for the environment
-    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
-    Radar1.write(autoGainCmd, sizeof(autoGainCmd)); delay(50);
-    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
-    
-    // 2. Set Max Distance to 3.5m (Gate 5) to completely ignore deep-room ghosts.
-    // 3.5m is 35 in 10cm units. Parameter ID 0x0001
-    sendConfigCmd(0x0001, 35);
-    
-    // 3. Set Target Disappearance Delay to 5 seconds. Parameter ID 0x0004
-    sendConfigCmd(0x0004, 5);
-    
-    // 4. Save Config
-    Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
-    Radar1.write(saveCmd, sizeof(saveCmd)); delay(50);
-    Radar1.write(endCmd, sizeof(endCmd)); delay(50);
+    // Removed Auto-Gain and Config saves from setup as they may hang the radar's
+    // boot sequence or conflict with engineering mode entry.
+    // The Watchdog will ensure Engineering Mode is active.
 
     lastDataRxTime = millis();
 }
@@ -788,6 +775,15 @@ void setup() {
 float currentPrimaryDistance = 0.0;
 
 void processExtractedPayload(uint8_t* payload, int len) {
+    if (len < 131) {
+        static unsigned long lastWarn = 0;
+        if (millis() - lastWarn > 2000) {
+            sendDiag("WARNING: Radar in NORMAL mode (len " + String(len) + "). Needs Engineering mode.");
+            lastWarn = millis();
+        }
+        return; // Do not process normal mode frames, wait for watchdog to fix it.
+    }
+
     uint8_t state = payload[0]; 
     uint16_t distance = payload[1] | (payload[2] << 8); 
     currentPrimaryDistance = distance;
@@ -930,11 +926,13 @@ void loop() {
     server.handleClient();
     webSocket.loop();
     
-    // Watchdog to wake radar if it gets stuck in configuration mode
+    // Watchdog to wake radar if it gets stuck in configuration mode or normal mode
     if (millis() - lastDataRxTime > 3000 && millis() > calibrationUnlockTime) {
         lastDataRxTime = millis(); // Reset watchdog
-        Radar1.write(endCmd, sizeof(endCmd));
-        sendDiag("[WATCHDOG] No data received. Forcing exit config mode...");
+        sendDiag("[WATCHDOG] No data/wrong mode. Forcing Engineering Mode...");
+        Radar1.write(enableCmd, sizeof(enableCmd)); delay(50);
+        Radar1.write(engModeCmd, sizeof(engModeCmd)); delay(50);
+        Radar1.write(endCmd, sizeof(endCmd)); delay(50);
     }
 
     // LED State Machine
@@ -1124,6 +1122,19 @@ void loop() {
             if (remaining > 0) memmove(frameBuf, frameBuf + bytesToRemove, remaining);
             frameLen = remaining;
             frameFound = true; 
+        } else {
+            // DEBUG RAW BUFFER
+            static unsigned long lastRawPrint = 0;
+            if (millis() - lastRawPrint > 1000 && frameLen >= 10) {
+                lastRawPrint = millis();
+                Serial.print("[RAW BUF] Len: ");
+                Serial.print(frameLen);
+                Serial.print(" | ");
+                for (int j = 0; j < min(frameLen, 40); j++) {
+                    Serial.printf("%02X ", frameBuf[j]);
+                }
+                Serial.println();
+            }
         }
     }
 }
